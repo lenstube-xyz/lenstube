@@ -11,7 +11,8 @@ import type {
 import {
   useBroadcastMutation,
   useCreateSetProfileImageUriTypedDataMutation,
-  useCreateSetProfileImageUriViaDispatcherMutation
+  useCreateSetProfileImageUriViaDispatcherMutation,
+  useNftChallengeLazyQuery
 } from 'lens'
 import type { ChangeEvent, FC } from 'react'
 import React, { useState } from 'react'
@@ -23,7 +24,10 @@ import getProfilePicture from 'utils/functions/getProfilePicture'
 import omitKey from 'utils/functions/omitKey'
 import sanitizeIpfsUrl from 'utils/functions/sanitizeIpfsUrl'
 import uploadToIPFS from 'utils/functions/uploadToIPFS'
-import { useContractWrite, useSignTypedData } from 'wagmi'
+import { useContractWrite, useSignMessage, useSignTypedData } from 'wagmi'
+
+import ChoosePicture from './ChoosePicture'
+import CropImageModal from './CropImageModal'
 
 type Props = {
   channel: Profile
@@ -36,6 +40,9 @@ const ChannelPicture: FC<Props> = ({ channel }) => {
   const setSelectedChannel = useAppStore((state) => state.setSelectedChannel)
   const userSigNonce = useAppStore((state) => state.userSigNonce)
   const setUserSigNonce = useAppStore((state) => state.setUserSigNonce)
+  const [showProfileModal, setProfileModal] = useState(false)
+  const [showCropImageModal, setCropImageModal] = useState(false)
+  const [imagePreviewSrc, setImagePreviewSrc] = useState<File>()
 
   const onError = (error: CustomErrorWithData) => {
     toast.error(error?.data?.message ?? error?.message ?? ERROR_MESSAGE)
@@ -117,6 +124,9 @@ const ChannelPicture: FC<Props> = ({ channel }) => {
     })
   }
 
+  const [loadChallenge] = useNftChallengeLazyQuery()
+  const { signMessageAsync } = useSignMessage()
+
   const createViaDispatcher = async (request: UpdateProfileImageRequest) => {
     const { data } = await createSetProfileImageViaDispatcher({
       variables: { request }
@@ -128,25 +138,82 @@ const ChannelPicture: FC<Props> = ({ channel }) => {
     }
   }
 
-  const onPfpUpload = async (e: ChangeEvent<HTMLInputElement>) => {
+  const onChooseImage = async (e: ChangeEvent<HTMLInputElement>) => {
     if (e.target.files?.length) {
-      try {
-        setLoading(true)
-        const result: IPFSUploadResult = await uploadToIPFS(e.target.files[0])
-        const request = {
-          profileId: selectedChannel?.id,
-          url: result.url
-        }
-        setSelectedPfp(result.url)
-        const canUseDispatcher = selectedChannel?.dispatcher?.canUseRelay
-        if (!canUseDispatcher) {
-          return signTypedData(request)
-        }
-        await createViaDispatcher(request)
-      } catch (error) {
-        onError(error as CustomErrorWithData)
-      }
+      setProfileModal(false)
+      setImagePreviewSrc(e.target.files[0])
+      setCropImageModal(true)
     }
+  }
+
+  const getPreviewImageSrc = (): string => {
+    const url = imagePreviewSrc
+      ? URL.createObjectURL(imagePreviewSrc as File)
+      : ''
+    return url
+  }
+
+  const onPfpUpload = async (file: File) => {
+    try {
+      setLoading(true)
+      setCropImageModal(false)
+      const result: IPFSUploadResult = await uploadToIPFS(file)
+      const request = {
+        profileId: selectedChannel?.id,
+        url: result.url
+      }
+      setSelectedPfp(result.url)
+      const canUseDispatcher = selectedChannel?.dispatcher?.canUseRelay
+      if (!canUseDispatcher) {
+        return signTypedData(request)
+      }
+      await createViaDispatcher(request)
+    } catch (error) {
+      onError(error as CustomErrorWithData)
+    }
+  }
+
+  const setNFTAvatar = async (
+    contractAddress: string,
+    tokenId: string,
+    chainId: Number
+  ) => {
+    try {
+      const challengeResponse = await loadChallenge({
+        variables: {
+          request: {
+            ethereumAddress: selectedChannel?.ownedBy,
+            nfts: [
+              {
+                contractAddress,
+                tokenId,
+                chainId
+              }
+            ]
+          }
+        }
+      })
+
+      const signature = await signMessageAsync({
+        message: challengeResponse?.data?.nftOwnershipChallenge?.text as string
+      })
+
+      const request = {
+        profileId: selectedChannel?.id,
+        nftData: {
+          id: challengeResponse?.data?.nftOwnershipChallenge?.id,
+          signature
+        }
+      }
+
+      if (selectedChannel?.dispatcher?.canUseRelay) {
+        return await createViaDispatcher(request)
+      }
+
+      return await createSetProfileImageURITypedData({
+        variables: { options: { overrideSigNonce: userSigNonce }, request }
+      })
+    } catch {}
   }
 
   return (
@@ -162,25 +229,33 @@ const ChannelPicture: FC<Props> = ({ channel }) => {
         alt={selectedPfp ? selectedChannel?.handle : channel.handle}
       />
       <label
-        htmlFor="choosePfp"
         className={clsx(
           'absolute top-0 grid w-32 h-32 bg-white rounded-full cursor-pointer bg-opacity-70 place-items-center backdrop-blur-lg invisible group-hover:visible dark:bg-theme',
           { '!visible': loading && !pfpData?.hash }
         )}
+        onClick={() => setProfileModal(true)}
       >
         {loading && !pfpData?.hash ? (
           <Loader />
         ) : (
           <RiImageAddLine className="text-xl" />
         )}
-        <input
-          id="choosePfp"
-          type="file"
-          accept=".png, .jpg, .jpeg, .svg, .gif"
-          className="hidden w-full"
-          onChange={onPfpUpload}
-        />
       </label>
+
+      <ChoosePicture
+        isModalOpen={showProfileModal}
+        onClose={() => setProfileModal(false)}
+        onChooseImage={onChooseImage}
+        channel={channel}
+        setNFTAvatar={setNFTAvatar}
+      />
+
+      <CropImageModal
+        isModalOpen={showCropImageModal}
+        onClose={() => setCropImageModal(false)}
+        getPreviewImageSrc={getPreviewImageSrc}
+        onPfpUpload={onPfpUpload}
+      />
     </div>
   )
 }
